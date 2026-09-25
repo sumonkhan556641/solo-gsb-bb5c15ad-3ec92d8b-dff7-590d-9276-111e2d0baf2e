@@ -82,6 +82,11 @@ class BatchPrecheckOut(BaseModel):
         ...,
         description="创建时胶卷状态（预期范围 + 实扫帧集合）的 SHA-256 指纹，确认时复核",
     )
+    state_revision: int | None = Field(
+        ...,
+        description="创建时胶卷的批次修订号（随批次实际新增/撤销单调递增、不回落），"
+        "确认时在同一写事务内复核；旧版预检单为 null（未确认的须重新预检）",
+    )
     confirmed: bool = Field(..., description="是否已确认导入")
     created_at: str
     confirmed_at: str | None = None
