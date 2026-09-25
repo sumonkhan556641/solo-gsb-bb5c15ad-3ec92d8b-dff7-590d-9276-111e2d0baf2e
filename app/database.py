@@ -111,9 +111,13 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_roll ON roll_snapshots (roll_no);
 
 -- 批次导入预检单：提交与 /batches 相同的数据，只生成持久化预检单而不写入批次。
 -- raw_frames_json 保留原始帧顺序（含批内重复）；state_fingerprint 为创建时胶卷
--- 状态（合并后预期范围 + 实扫帧集合）的指纹，确认时在同一写事务内复核，
--- 不一致则拒绝导入（409）。确认成功后 result_json 冻结首次导入结果，
--- 同一预检单再次确认原样返回。
+-- 状态（合并后预期范围 + 实扫帧集合）的指纹。真正的失效判定依据是
+-- batch_revision——创建时该胶卷的单调递增批次修订号（见 roll_revisions），
+-- 确认时在同一写事务内复核，不一致则拒绝导入（409）；这样即使新批次的预期
+-- 区间与帧号已被完全覆盖、汇总不变，甚至“新增后又撤销、汇总恢复”，预检也
+-- 必然失效。确认成功后 result_json 冻结首次导入结果，同一预检单再次确认原样返回。
+-- batch_revision 为 NULL 表示旧库升级前创建的预检单：未确认者确认时一律 409
+-- 要求重新预检，已确认者仍按 result_json 冻结结果返回。
 CREATE TABLE IF NOT EXISTS import_prechecks (
     id                    TEXT PRIMARY KEY,
     roll_no               TEXT NOT NULL,
@@ -122,6 +126,7 @@ CREATE TABLE IF NOT EXISTS import_prechecks (
     raw_frames_json       TEXT NOT NULL,
     batch_id              TEXT,
     state_fingerprint     TEXT NOT NULL,
+    batch_revision        INTEGER,
     current_expected_json TEXT NOT NULL,
     added_frames_json     TEXT NOT NULL,
     duplicates_json       TEXT NOT NULL,
@@ -134,6 +139,17 @@ CREATE TABLE IF NOT EXISTS import_prechecks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prechecks_roll ON import_prechecks (roll_no);
+
+-- 胶卷批次修订号：每卷一个持久化、单调递增的整数。仅当批次**实际新增**
+-- （普通导入、预检确认、补扫回执）或**撤销**时在原写事务内 +1；
+-- 内容幂等重试（不写批次）不递增。预检创建时快照该号、确认时在同一写事务
+-- 内复核，任何批次变动（即使汇总区间与帧集合不变，或新增后又撤销）都使
+-- 修订号前进，旧预检据此稳定失效。行在首次变动时创建，最后一批撤销后仍保留
+-- （同编号胶卷重新导入时修订号继续累加，绝不回退）。
+CREATE TABLE IF NOT EXISTS roll_revisions (
+    roll_no  TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
+);
 
 -- 扫描瑕疵复核：按批次**原始帧列表**的 0 起算位置登记瑕疵（模糊、划痕、曝光异常）。
 -- 每个位置至多一条标记；PUT 接口整体替换（先全删再插）。批次撤销时在同一写事务内
@@ -177,6 +193,9 @@ def init_db() -> None:
     旧版库（没有 raw_frames_json 列）通过 ALTER TABLE 平滑升级；
     旧批次该列为 NULL，撤销时据此判定能否安全重建（详见 services.delete_batch）。
     旧版 rescan_claims 没有 completed_at 列，同样幂等补齐（补扫回执结案标记）。
+    旧版 import_prechecks 没有 batch_revision 列，同样幂等补齐；列补齐后旧
+    预检单该值为 NULL，确认时据此判定：未确认旧预检返回 409 要求重新预检，
+    已确认旧预检仍按冻结结果返回（详见 services.confirm_precheck）。
     """
     conn = _connect()
     try:
@@ -189,6 +208,11 @@ def init_db() -> None:
         }
         if "completed_at" not in claim_cols:
             conn.execute("ALTER TABLE rescan_claims ADD COLUMN completed_at TEXT")
+        precheck_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(import_prechecks)").fetchall()
+        }
+        if "batch_revision" not in precheck_cols:
+            conn.execute("ALTER TABLE import_prechecks ADD COLUMN batch_revision INTEGER")
     finally:
         conn.close()
 

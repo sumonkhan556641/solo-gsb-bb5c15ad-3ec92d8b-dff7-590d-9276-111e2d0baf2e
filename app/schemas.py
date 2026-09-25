@@ -80,7 +80,14 @@ class BatchPrecheckOut(BaseModel):
     )
     state_fingerprint: str = Field(
         ...,
-        description="创建时胶卷状态（预期范围 + 实扫帧集合）的 SHA-256 指纹，确认时复核",
+        description="创建时胶卷状态（预期范围 + 实扫帧集合）的 SHA-256 指纹，供展示与防御性复核",
+    )
+    batch_revision: int | None = Field(
+        ...,
+        description="创建时胶卷持久化、单调递增的批次修订号（批次实际导入/撤销才递增，"
+        "内容幂等重试不递增）；确认时在同一写事务内复核，不一致即 409。"
+        "旧库升级前创建的预检单为 null：未确认者确认时一律 409 要求重新预检，"
+        "已确认者仍返回首次冻结结果。",
     )
     confirmed: bool = Field(..., description="是否已确认导入")
     created_at: str

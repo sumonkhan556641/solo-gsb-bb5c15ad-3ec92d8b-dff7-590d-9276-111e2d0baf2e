@@ -284,6 +284,45 @@ class BatchIdConflictError(Exception):
         super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
 
 
+def _get_batch_revision(
+    conn: sqlite3.Connection, roll_no: str
+) -> int:
+    """读取胶卷当前批次修订号；尚无修订记录（从未实际增删批次）时为 0。
+
+    可在任意已开启的事务内调用。修订号持久化、单调递增：仅在批次实际新增
+    或撤销时由 ``_bump_batch_revision`` 在同一写事务内 +1。
+    """
+    row = conn.execute(
+        "SELECT revision FROM roll_revisions WHERE roll_no = ?", (roll_no,)
+    ).fetchone()
+    return row["revision"] if row is not None else 0
+
+
+def _bump_batch_revision(conn: sqlite3.Connection, roll_no: str) -> int:
+    """在**已开启的写事务内**把胶卷批次修订号 +1，返回递增后的值。
+
+    只允许在批次**实际新增**（普通导入、预检确认导入、补扫回执）或**撤销**
+    的写事务内调用；内容幂等重试（不写批次）不得调用，因此重试不递增。
+    行在首次变动时惰性创建；最后一批撤销后行保留，同编号胶卷重新导入继续累加。
+    """
+    row = conn.execute(
+        "SELECT revision FROM roll_revisions WHERE roll_no = ?", (roll_no,)
+    ).fetchone()
+    if row is None:
+        revision = 1
+        conn.execute(
+            "INSERT INTO roll_revisions (roll_no, revision) VALUES (?, ?)",
+            (roll_no, revision),
+        )
+    else:
+        revision = row["revision"] + 1
+        conn.execute(
+            "UPDATE roll_revisions SET revision = ? WHERE roll_no = ?",
+            (revision, roll_no),
+        )
+    return revision
+
+
 def _import_batch_tx(
     conn: sqlite3.Connection,
     roll_no: str,
@@ -296,6 +335,8 @@ def _import_batch_tx(
 
     调用方须先持有 BEGIN IMMEDIATE 事务。返回 (batch_id, 新增帧, 重复帧)。
     若显式 batch_id 已被其他内容占用，抛 BatchIdConflictError（由调用方回滚）。
+    实际写入新批次后会在同一事务内把该胶卷批次修订号 +1
+    （见 ``_bump_batch_revision``）；内容幂等重试由调用方提前短路，不走到本函数。
     """
     frames = sorted(set(frames_in))
     raw_frames = list(frames_in)  # 保留原始帧列表（含批内重复、保序），供撤销时重建
@@ -347,6 +388,8 @@ def _import_batch_tx(
         "INSERT OR IGNORE INTO roll_frames (roll_no, frame_no, batch_id) VALUES (?, ?, ?)",
         [(roll_no, f, batch_id) for f in new_frames],
     )
+    # 批次实际新增：在同一写事务内推进该胶卷的单调修订号（幂等重试不会走到这里）
+    _bump_batch_revision(conn, roll_no)
     return batch_id, new_frames, duplicates
 
 
@@ -413,11 +456,19 @@ class PrecheckNotFoundError(Exception):
 
 
 class PrecheckStaleError(Exception):
-    """确认时胶卷状态指纹与预检单创建时不一致，拒绝落库。"""
+    """确认时胶卷批次修订号与预检单创建时不一致，拒绝落库。"""
 
     def __init__(self, precheck_id: str):
         self.precheck_id = precheck_id
         super().__init__(f"预检单对应的胶卷状态已变化: {precheck_id}")
+
+
+class PrecheckLegacyRevisionError(Exception):
+    """旧库升级前创建的未确认预检单没有批次修订号，无法安全复核，要求重新预检。"""
+
+    def __init__(self, precheck_id: str):
+        self.precheck_id = precheck_id
+        super().__init__(f"旧预检单缺少批次修订号，需重新预检: {precheck_id}")
 
 
 def _state_fingerprint(
@@ -427,7 +478,11 @@ def _state_fingerprint(
 ) -> str:
     """胶卷当前状态指纹：合并后的预期闭区间 + 去重排序实扫帧集合的 SHA-256。
 
-    预检单创建时固化一份；确认时在同一写事务内重算，两者一致才允许导入。
+    预检单创建时固化一份，随预检单返回供客户端核对。注意：该指纹只覆盖
+    汇总状态，**不能**区分“汇总不变但批次内容/身份已变”（如导入一个范围
+    与帧号均被覆盖但内容不同的批次，或新增后又撤销）；预检失效判定的权威
+    依据是单调递增的批次修订号（见 ``_get_batch_revision``），确认时在同一
+    写事务内复核修订号，本指纹仅作防御性复核与对外展示。
     """
     payload = json.dumps(
         {
@@ -455,6 +510,7 @@ def _precheck_out(r: sqlite3.Row) -> schemas.BatchPrecheckOut:
         post_import_expected_ranges=json.loads(r["post_expected_json"]),
         post_import_missing_ranges=json.loads(r["post_missing_json"]),
         state_fingerprint=r["state_fingerprint"],
+        batch_revision=r["batch_revision"],
         confirmed=r["confirmed_at"] is not None,
         created_at=r["created_at"],
         confirmed_at=r["confirmed_at"],
@@ -466,10 +522,11 @@ def create_precheck(
 ) -> schemas.BatchPrecheckOut:
     """生成持久化预检单（不写批次、不改胶卷汇总）。
 
-    BEGIN IMMEDIATE 与并发写入串行化，预检内容与状态指纹对应同一读状态：
+    BEGIN IMMEDIATE 与并发写入串行化，预检内容与批次修订号对应同一读状态：
     相对当前胶卷状态计算新增帧、重复帧（含批内重复）、导入后合并预期范围
-    与缺帧区间，并把原始帧顺序、原始请求与状态指纹一起持久化。
-    胶卷尚不存在（未导入过批次）时当前状态按空集合处理，同样允许预检。
+    与缺帧区间，并把原始帧顺序、原始请求、状态指纹与创建时的**批次修订号**
+    一起持久化。胶卷尚不存在（未导入过批次）时当前状态按空集合处理
+    （修订号为 0），同样允许预检。
     """
     precheck_id = uuid.uuid4().hex
 
@@ -478,6 +535,7 @@ def create_precheck(
         expected = _expected_ranges(conn, data.roll_no)
         existing_frames = _all_frames(conn, data.roll_no)
         fingerprint = _state_fingerprint(data.roll_no, expected, existing_frames)
+        batch_revision = _get_batch_revision(conn, data.roll_no)
 
         raw_frames = list(data.frames)  # 保留原始顺序与批内重复
         frame_set = set(raw_frames)
@@ -495,10 +553,10 @@ def create_precheck(
         conn.execute(
             """INSERT INTO import_prechecks
                    (id, roll_no, expected_start, expected_end, raw_frames_json,
-                    batch_id, state_fingerprint, current_expected_json,
+                    batch_id, state_fingerprint, batch_revision, current_expected_json,
                     added_frames_json, duplicates_json,
                     post_expected_json, post_missing_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 precheck_id,
                 data.roll_no,
@@ -507,6 +565,7 @@ def create_precheck(
                 json.dumps(raw_frames),
                 data.batch_id,
                 fingerprint,
+                batch_revision,
                 json.dumps([list(x) for x in expected]),
                 json.dumps(added),
                 json.dumps(duplicates),
@@ -538,12 +597,16 @@ def get_precheck(
 def confirm_precheck(
     conn: sqlite3.Connection, precheck_id: str
 ) -> tuple[schemas.BatchPrecheckConfirmOut, int]:
-    """确认预检单：复核状态指纹后执行与 POST /batches 相同的导入逻辑。
+    """确认预检单：复核批次修订号后执行与 POST /batches 相同的导入逻辑。
 
-    指纹复核与导入在同一 BEGIN IMMEDIATE 写事务内完成：
+    修订号复核与导入在同一 BEGIN IMMEDIATE 写事务内完成：
 
     - 预检单不存在 → PrecheckNotFoundError（接口 404）；
-    - 当前胶卷状态指纹与创建时不同 → PrecheckStaleError（接口 409），不落库；
+    - 预检单没有批次修订号（旧库升级前创建且未确认）→
+      PrecheckLegacyRevisionError（接口 409，提示重新预检），不落库；
+    - 当前胶卷批次修订号与创建时不同（期间有批次实际导入或撤销，包括
+      “汇总不变的内容不同批次”与“新增后又撤销、汇总恢复”两种隐蔽漂移）→
+      PrecheckStaleError（接口 409），不落库；
     - 首次确认：按现有逻辑导入（内容已被并发导入则按幂等重复处理，200），
       冻结导入结果后提交；显式 batch_id 被其他内容占用 → BatchIdConflictError（409）；
     - 同一预检单再次确认：原样返回首次冻结的导入结果（200，confirmed=true）。
@@ -558,7 +621,7 @@ def confirm_precheck(
         if pc is None:
             raise PrecheckNotFoundError(precheck_id)
 
-        # 已确认过：返回首次冻结的结果，不再导入
+        # 已确认过：返回首次冻结的结果，不再导入（含旧库升级前已确认的旧预检单）
         if pc["result_json"] is not None:
             frozen = json.loads(pc["result_json"])
             conn.execute("ROLLBACK")
@@ -570,7 +633,17 @@ def confirm_precheck(
             )
             return out, 200
 
-        # 同一写事务内复核创建时的胶卷状态指纹
+        # 旧库升级前创建的未确认预检单没有批次修订号，无法安全复核：
+        # 一律拒绝导入，要求重新预检（预检单保留，不落库）
+        if pc["batch_revision"] is None:
+            raise PrecheckLegacyRevisionError(precheck_id)
+
+        # 同一写事务内复核创建时的批次修订号：批次实际新增或撤销（含汇总
+        # 不变、或新增后又撤销导致汇总恢复的情况）都会使修订号前进
+        if _get_batch_revision(conn, pc["roll_no"]) != pc["batch_revision"]:
+            raise PrecheckStaleError(precheck_id)
+
+        # 防御性复核：汇总状态指纹也应一致（修订号已是权威判定，指纹仅兜底）
         expected = _expected_ranges(conn, pc["roll_no"])
         existing_frames = _all_frames(conn, pc["roll_no"])
         fingerprint = _state_fingerprint(pc["roll_no"], expected, existing_frames)
@@ -631,6 +704,9 @@ def confirm_precheck(
     except PrecheckStaleError:
         conn.execute("ROLLBACK")
         raise
+    except PrecheckLegacyRevisionError:
+        conn.execute("ROLLBACK")
+        raise
     except BatchIdConflictError:
         conn.execute("ROLLBACK")
         raise
@@ -686,7 +762,8 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
       （批内重复保留；跨批重复按重建后的前缀集合重算）。
     - 若剩余批次中存在旧版数据（raw_frames_json 为 NULL，无法区分批内与
       跨批重复），抛 LegacyBatchDataError（接口返回 409）且不改变任何数据。
-    - 最后一批撤销后胶卷视为不存在：清空其预期范围与帧，并把该胶卷全部
+    - 撤销实际生效时在同一写事务内把该胶卷批次修订号 +1（未确认预检据此失效）；
+      最后一批撤销后胶卷视为不存在：清空其预期范围与帧，并把该胶卷全部
       未释放的历史认领标记为已释放，使其不阻碍同编号胶卷重新导入后的领取。
     """
     conn.execute("BEGIN IMMEDIATE")
@@ -724,6 +801,10 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
         conn.execute(
             "DELETE FROM roll_expected WHERE roll_no = ?", (roll_no,)
         )
+        # 批次实际撤销：在同一写事务内推进单调修订号。即使撤销后汇总区间与
+        # 实扫帧集合恰好恢复到预检创建时的状态（新增后又撤销），修订号也已
+        # 两次前进，未确认预检仍稳定失效。
+        _bump_batch_revision(conn, roll_no)
 
         if not remaining:
             # 胶卷下再无批次：胶卷视为不存在。历史认领即时释放，
