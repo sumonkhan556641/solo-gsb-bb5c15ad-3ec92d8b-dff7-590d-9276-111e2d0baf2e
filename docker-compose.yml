@@ -1,0 +1,26 @@
+services:
+  film-api:
+    build: .
+    image: film-archive-api:latest
+    container_name: film-archive-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内数据库路径；首次启动自动初始化
+      DB_PATH: /data/film.db
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # SQLite 写锁等待（毫秒）
+      DB_TIMEOUT: "30000"
+    volumes:
+      - film-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  film-data:
